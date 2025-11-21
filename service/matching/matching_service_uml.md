@@ -133,10 +133,13 @@ classDiagram
 
     class priBacklogManagerImpl {
         -pqMgr physicalTaskQueueManager
-        -taskQueueDB taskQueueDB
-        -taskWriter taskWriter
-        -taskReader taskReader
-        -ackManager ackManager
+        -config Config
+        -db taskQueueDB
+        -taskWriter priTaskWriter
+        -subqueues []priTaskReader
+        -subqueuesByPriority map
+        +SpoolTask()
+        +BacklogStatsByPriority()
     }
 
     %% Persistence Layer
@@ -145,27 +148,30 @@ classDiagram
         +CompleteTasksLessThan()
         +GetTasks()
         +UpdateState()
+        +SyncState()
     }
 
-    class taskWriter {
+    class priTaskWriter {
+        -backlogMgr priBacklogManagerImpl
         -db taskQueueDB
         -appendCh chan~writeTaskRequest~
+        -taskIDBlock taskIDBlock
+        +Start()
         +appendTask()
+        +appendTasks()
     }
 
-    class taskReader {
-        -db taskQueueDB
-        -pqMgr physicalTaskQueueManager
-        +getTaskBatch()
-        +addTasksToMatcher()
-    }
-
-    class ackManager {
-        -db taskQueueDB
-        -backlogAge int64
-        +addTask()
+    class priTaskReader {
+        -backlogMgr priBacklogManagerImpl
+        -subqueue subqueueIndex
+        -notifyC chan
+        -outstandingTasks treemap
+        -readLevel int64
+        -ackLevel int64
+        +Start()
+        +getTasksPump()
+        +addTaskToMatcher()
         +completeTask()
-        +getAckLevel()
     }
 
     %% User Data Manager
@@ -222,14 +228,12 @@ classDiagram
 
     backlogManager <|.. priBacklogManagerImpl : implements
     priBacklogManagerImpl --> taskQueueDB : uses
-    priBacklogManagerImpl --> taskWriter : uses
-    priBacklogManagerImpl --> taskReader : uses
-    priBacklogManagerImpl --> ackManager : uses
+    priBacklogManagerImpl --> priTaskWriter : uses
+    priBacklogManagerImpl --> priTaskReader : subqueues *
 
-    taskWriter --> taskQueueDB : writes to
-    taskReader --> taskQueueDB : reads from
-    taskReader --> priTaskMatcher : AddTask
-    ackManager --> taskQueueDB : updates
+    priTaskWriter --> taskQueueDB : writes to
+    priTaskReader --> taskQueueDB : reads from
+    priTaskReader --> priTaskMatcher : addTaskToMatcher
 ```
 
 ## 架构层次说明
