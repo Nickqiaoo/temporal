@@ -268,7 +268,7 @@ PollTask: Handler → Engine → PartitionManager → PhysicalQueueManager → M
 
 ---
 
-## AddTask 流程图
+## AddTask 流程图 (priTaskMatcher)
 
 ```mermaid
 flowchart TD
@@ -281,47 +281,55 @@ flowchart TD
     UsePartition --> PartitionAdd[partitionManager.AddTask]
 
     PartitionAdd --> GetPhysicalQueue[getPhysicalQueue<br/>根据版本选择队列]
-    GetPhysicalQueue --> PhysicalAdd[physicalTaskQueueManager.AddTask]
+    GetPhysicalQueue --> TrySyncMatch[physicalTaskQueueManager.TrySyncMatch]
 
-    PhysicalAdd --> CheckForwarding{是否需要转发?<br/>非root分区}
-    CheckForwarding --> |是| Forward[Forwarder.ForwardTask<br/>转发到父分区]
-    Forward --> ForwardResult{转发成功?}
-    ForwardResult --> |是| ReturnSuccess([返回成功])
-    ForwardResult --> |否| TrySyncMatch
+    TrySyncMatch --> PriOffer[priTaskMatcher.Offer]
+    PriOffer --> MatchImmediate[matcherData.MatchTaskImmediately]
 
-    CheckForwarding --> |否| TrySyncMatch[尝试同步匹配]
-
-    TrySyncMatch --> MatcherOffer[TaskMatcher.Offer / priTaskMatcher.AddTask]
-    MatcherOffer --> HasPoller{有等待的Poller?}
-
-    HasPoller --> |是| SyncMatch[同步匹配成功<br/>直接交付任务]
+    MatchImmediate --> HasPoller{有等待的Poller<br/>或TaskForwarder?}
+    HasPoller --> |是 - Poller| SyncMatch[同步匹配成功<br/>直接交付给Poller]
+    HasPoller --> |是 - TaskForwarder| ForwardTask[后台goroutine<br/>priForwarder.ForwardTask]
+    ForwardTask --> ParentPartition[转发到父分区]
+    ParentPartition --> ReturnSuccess([返回成功])
     SyncMatch --> ReturnSuccess
 
-    HasPoller --> |否| SpoolTask[SpoolTask 持久化到积压]
+    HasPoller --> |否| CheckBlock{是root且<br/>转发来的backlog?}
+    CheckBlock --> |是| EnqueueWait[matcherData.EnqueueTaskAndWait<br/>阻塞等待匹配]
+    EnqueueWait --> WaitMatch[等待Poller到达]
+    WaitMatch --> ReturnSuccess
+
+    CheckBlock --> |否| SyncFail[同步匹配失败]
+    SyncFail --> SpoolTask[physicalTaskQueueManager.SpoolTask]
     SpoolTask --> BacklogMgr[backlogManager.SpoolTask]
-    BacklogMgr --> TaskWriter[taskWriter.appendTask]
-    TaskWriter --> DB[(taskQueueDB.CreateTasks)]
-    DB --> AckMgr[ackManager.addTask]
-    AckMgr --> ReturnSuccess
+    BacklogMgr --> TaskWriter[taskWriter写入DB]
+    TaskWriter --> DB[(持久化到数据库)]
+    DB --> TaskReader[taskReader读取任务]
+    TaskReader --> AddToMatcher[priMatcher.AddTask]
+    AddToMatcher --> EnqueueNoWait[matcherData.EnqueueTaskNoWait<br/>加入任务队列等待匹配]
+    EnqueueNoWait --> ReturnSuccess
 
     style Start fill:#e1f5fe
     style ReturnSuccess fill:#c8e6c9
     style DB fill:#fff3e0
     style SyncMatch fill:#c8e6c9
+    style ForwardTask fill:#e8f5e9
 ```
 
-### AddTask 流程说明
+### AddTask 流程说明 (pri逻辑)
 
 1. **入口**: History Service 通过 gRPC 调用 Matching Service
 2. **路由**: Engine 根据 TaskQueue 名称和分区找到或创建 PartitionManager
 3. **版本选择**: PartitionManager 根据 Worker 版本选择正确的物理队列
-4. **转发**: 如果当前是子分区,尝试转发到父分区以提高匹配效率
-5. **同步匹配**: 尝试直接匹配等待的 Poller (零延迟)
-6. **持久化**: 如果没有等待的 Poller,将任务写入数据库积压
+4. **同步匹配尝试**:
+   - `priTaskMatcher.Offer` → `matcherData.MatchTaskImmediately`
+   - 如果有等待的Poller,直接匹配交付
+   - 如果匹配到TaskForwarder (子分区后台goroutine),任务被转发到父分区
+5. **阻塞等待**: Root分区收到转发来的backlog任务会阻塞等待Poller
+6. **持久化**: 同步匹配失败后,写入backlog,taskReader读取后调用`AddTask`加入匹配队列
 
 ---
 
-## PollTask 流程图
+## PollTask 流程图 (priTaskMatcher)
 
 ```mermaid
 flowchart TD
@@ -333,73 +341,101 @@ flowchart TD
     PartitionPoll --> GetPhysicalQueue[getPhysicalQueue<br/>根据 Worker 版本选择]
     GetPhysicalQueue --> PhysicalPoll[physicalTaskQueueManager.PollTask]
 
-    PhysicalPoll --> RateLimit[rateLimitManager.Wait<br/>等待限流令牌]
-    RateLimit --> MatcherPoll[TaskMatcher.Poll / priTaskMatcher.AddPoller]
+    PhysicalPoll --> MatcherPoll[priTaskMatcher.Poll]
+    MatcherPoll --> CreatePoller[创建 waitingPoller<br/>设置 forwardCtx 和 pollMetadata]
+    CreatePoller --> EnqueuePoller[matcherData.EnqueuePollerAndWait]
 
-    MatcherPoll --> CheckTask{检查任务来源}
+    EnqueuePoller --> CheckMatch{matcherData 匹配}
+    CheckMatch --> |有等待的任务| GetTask[从任务队列获取任务]
+    CheckMatch --> |无任务| WaitInQueue[Poller加入等待队列]
 
-    CheckTask --> |有同步任务| SyncTask[从 Matcher 获取同步任务]
-    SyncTask --> RecordStart[recordWorkflowTaskStarted<br/>调用 History Service]
+    WaitInQueue --> WaitForTask[等待任务到达或超时]
+    WaitForTask --> |超时| Timeout([返回 errNoTasks])
+    WaitForTask --> |任务到达| GetTask
 
-    CheckTask --> |有积压任务| BacklogTask[从 Backlog 获取任务]
-    BacklogTask --> TaskReader[taskReader.dispatchTasks]
-    TaskReader --> DB[(taskQueueDB.GetTasks)]
-    DB --> RecordStart
+    GetTask --> CheckTaskType{任务类型}
+    CheckTaskType --> |同步任务| SyncTask[Offer来的同步任务]
+    CheckTaskType --> |Backlog任务| BacklogTask[taskReader读取的任务]
+    CheckTaskType --> |转发来的任务| ForwardedTask[从父分区转发来]
 
-    CheckTask --> |无任务| CheckForward{是否可以转发?}
-    CheckForward --> |是| ForwardPoll[Forwarder.ForwardPoll<br/>转发到父分区]
-    ForwardPoll --> ForwardResult{转发成功?}
-    ForwardResult --> |是| RecordStart
-    ForwardResult --> |否| Wait[等待任务到达<br/>阻塞直到超时]
+    SyncTask --> CheckExpired
+    BacklogTask --> CheckExpired
+    ForwardedTask --> CheckExpired{任务是否过期?}
 
-    CheckForward --> |否| Wait
-    Wait --> Timeout{超时?}
-    Timeout --> |是| ReturnEmpty([返回空响应])
-    Timeout --> |否| CheckTask
+    CheckExpired --> |是| ExpireTask[标记过期,继续等待]
+    ExpireTask --> EnqueuePoller
+    CheckExpired --> |否| RecordStart[recordWorkflowTaskStarted<br/>调用 History Service]
 
-    RecordStart --> HistoryCall[historyClient.RecordWorkflowTaskStarted]
-    HistoryCall --> AckTask[ackManager.completeTask]
-    AckTask --> ReturnTask([返回任务给 Worker])
+    RecordStart --> ReturnTask([返回任务给 Worker])
 
     style Start fill:#e1f5fe
     style ReturnTask fill:#c8e6c9
-    style ReturnEmpty fill:#ffcdd2
-    style DB fill:#fff3e0
+    style Timeout fill:#ffcdd2
+    style GetTask fill:#e8f5e9
 ```
 
-### PollTask 流程说明
+### 子分区后台 Goroutine
+
+```mermaid
+flowchart LR
+    subgraph 子分区后台处理
+        direction TB
+        FT[forwardTasks goroutine] --> EnqueueAsPoller[以TaskForwarder身份<br/>EnqueuePollerAndWait]
+        EnqueueAsPoller --> GetBacklogTask[获取backlog任务]
+        GetBacklogTask --> Forward[priForwarder.ForwardTask<br/>转发到父分区]
+
+        FP[forwardPolls goroutine] --> EnqueueForwarderTask[以ForwarderTask身份<br/>EnqueueTaskAndWait]
+        EnqueueForwarderTask --> GetPoller[获取等待的Poller]
+        GetPoller --> ForwardPoll[priForwarder.ForwardPoll<br/>转发到父分区]
+        ForwardPoll --> |成功| FinishMatch[FinishMatchAfterPollForward]
+        ForwardPoll --> |失败| ReenqueuePoller[ReenqueuePollerIfNotMatched<br/>重新入队]
+    end
+
+    style Forward fill:#e8f5e9
+    style ForwardPoll fill:#e8f5e9
+```
+
+### PollTask 流程说明 (pri逻辑)
 
 1. **入口**: Worker 通过 gRPC 长轮询 Matching Service
-2. **限流**: 通过 rateLimitManager 控制分发速率
-3. **任务来源优先级**:
-   - **同步任务**: 直接从 Matcher 获取刚添加的任务 (最低延迟)
-   - **积压任务**: 从数据库读取之前持久化的任务
-   - **转发任务**: 转发 Poll 到父分区获取任务
-4. **记录启动**: 调用 History Service 记录任务已被 Worker 领取
-5. **确认完成**: 更新 ackManager 以便清理已完成的任务
-6. **超时处理**: 如果在超时时间内没有任务,返回空响应
+2. **创建Poller**: 创建 `waitingPoller` 包含转发上下文和元数据
+3. **入队等待**: `matcherData.EnqueuePollerAndWait` 将Poller加入等待队列
+4. **匹配机制**: matcherData 统一管理任务和Poller的匹配:
+   - 如果有等待的任务,立即匹配返回
+   - 否则Poller加入队列等待任务到达
+5. **任务来源**:
+   - **同步任务**: 通过 `Offer` 添加的任务
+   - **Backlog任务**: taskReader 读取后通过 `AddTask` 添加
+   - **转发任务**: 从子分区转发来的任务
+6. **子分区转发**: 后台goroutine负责:
+   - `forwardTasks`: 将本地backlog任务转发到父分区
+   - `forwardPolls`: 将本地Poller转发到父分区获取任务
+7. **过期检查**: 返回前检查任务是否过期,过期则丢弃继续等待
 
 ---
 
-## 同步匹配机制
+## 同步匹配机制 (matcherData)
 
 ```mermaid
 flowchart LR
     subgraph AddTask流程
-        Task[新任务] --> Offer[Matcher.Offer]
+        Task[新任务] --> Offer[priTaskMatcher.Offer]
+        Offer --> MatchImm[MatchTaskImmediately]
     end
 
-    subgraph Matcher
-        Offer --> Check{有等待Poller?}
-        Check --> |是| Match[直接匹配]
-        Check --> |否| Queue[入队等待]
+    subgraph matcherData
+        MatchImm --> CheckPoller{pollerQueues<br/>有等待Poller?}
+        CheckPoller --> |是| Match[直接匹配]
+        CheckPoller --> |否| EnqueueTask[EnqueueTaskAndWait<br/>加入taskQueues]
+
+        EnqueuePoll --> CheckTask{taskQueues<br/>有等待任务?}
+        CheckTask --> |是| Match
+        CheckTask --> |否| WaitPoller[加入pollerQueues<br/>等待任务]
     end
 
     subgraph PollTask流程
-        Poller[Poller] --> Poll[Matcher.Poll]
-        Poll --> Check2{有等待任务?}
-        Check2 --> |是| Match
-        Check2 --> |否| Wait[入队等待]
+        Poller[Poller] --> Poll[priTaskMatcher.Poll]
+        Poll --> EnqueuePoll[EnqueuePollerAndWait]
     end
 
     Match --> Success([匹配成功<br/>零延迟交付])
@@ -407,6 +443,16 @@ flowchart LR
     style Match fill:#c8e6c9
     style Success fill:#c8e6c9
 ```
+
+### matcherData 核心数据结构
+
+- **taskQueues (taskPQ)**: 等待匹配的任务优先级队列
+- **pollerQueues (pollerPQ)**: 等待任务的Poller优先级队列
+- **关键方法**:
+  - `MatchTaskImmediately`: 快速路径,尝试立即匹配
+  - `EnqueueTaskAndWait`: 任务入队并阻塞等待Poller
+  - `EnqueuePollerAndWait`: Poller入队并阻塞等待任务
+  - `EnqueueTaskNoWait`: Backlog任务入队不阻塞
 
 同步匹配是 Matching Service 的核心优化:
 - 当任务和 Poller 同时存在时,直接匹配,跳过数据库
