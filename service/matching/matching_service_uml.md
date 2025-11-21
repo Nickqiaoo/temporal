@@ -64,50 +64,61 @@ classDiagram
         <<interface>>
         +Start()
         +Stop()
-        +AddTask()
+        +TrySyncMatch()
         +PollTask()
         +SpoolTask()
-        +HasBackloggedTasks()
     }
 
     class physicalTaskQueueManagerImpl {
         -queue PhysicalTaskQueueKey
         -config Config
         -backlogMgr backlogManager
-        -matcher TaskMatcher
         -priMatcher priTaskMatcher
         -liveness liveness
+        -taskValidator taskValidator
     }
 
-    %% Task Matcher Layer
-    class TaskMatcher {
-        -config Config
-        -fwdr Forwarder
-        -taskC chan~internalTask~
-        -queryTaskC chan~internalTask~
-        +Offer()
-        +OfferQuery()
-        +MustOffer()
-        +Poll()
-    }
-
+    %% Task Matcher Layer (pri)
     class priTaskMatcher {
         -config Config
         -fwdr priForwarder
         -data matcherData
-        -readyCond sync.Cond
+        -tqCtx context.Context
+        -validator taskValidator
+        +Offer()
+        +OfferQuery()
+        +Poll()
         +AddTask()
-        +AddPoller()
-        +WaitForTask()
+        +ReprocessAllTasks()
     }
 
     class matcherData {
         -taskQueues taskPQ
         -pollerQueues pollerPQ
-        +addTask()
-        +addPoller()
-        +waitingPollerCount()
-        +backloggedTaskCount()
+        +MatchTaskImmediately()
+        +EnqueueTaskAndWait()
+        +EnqueuePollerAndWait()
+        +EnqueueTaskNoWait()
+        +ReenqueuePollerIfNotMatched()
+    }
+
+    class waitingPoller {
+        +waitableMatchResult
+        +startTime time.Time
+        +forwardCtx context.Context
+        +pollMetadata pollMetadata
+        +queryOnly bool
+        +isTaskForwarder bool
+    }
+
+    %% Forwarder Layer (pri)
+    class priForwarder {
+        -client MatchingServiceClient
+        -partition tqid.Partition
+        -cfg forwarderConfig
+        +ForwardTask()
+        +ForwardPoll()
+        +ForwardQueryTask()
     }
 
     %% Backlog Manager Layer
@@ -117,15 +128,15 @@ classDiagram
         +Stop()
         +SpoolTask()
         +BacklogStatus()
-        +TasksRemaining()
+        +WaitUntilInitialized()
     }
 
-    class backlogManagerImpl {
+    class priBacklogManagerImpl {
+        -pqMgr physicalTaskQueueManager
         -taskQueueDB taskQueueDB
         -taskWriter taskWriter
         -taskReader taskReader
         -ackManager ackManager
-        -outstandingTasksLimit int
     }
 
     %% Persistence Layer
@@ -137,16 +148,16 @@ classDiagram
     }
 
     class taskWriter {
-        -taskQueueDB taskQueueDB
+        -db taskQueueDB
         -appendCh chan~writeTaskRequest~
         +appendTask()
     }
 
     class taskReader {
-        -taskQueueDB taskQueueDB
-        -dispatchCh chan~internalTask~
+        -db taskQueueDB
+        -pqMgr physicalTaskQueueManager
         +getTaskBatch()
-        +dispatchTasks()
+        +addTasksToMatcher()
     }
 
     class ackManager {
@@ -155,23 +166,6 @@ classDiagram
         +addTask()
         +completeTask()
         +getAckLevel()
-    }
-
-    %% Forwarder Layer
-    class Forwarder {
-        -client MatchingServiceClient
-        -taskQueueID tqid.TaskQueue
-        +ForwardTask()
-        +ForwardPoll()
-        +ForwardQueryTask()
-    }
-
-    class priForwarder {
-        -client MatchingServiceClient
-        -partition tqid.Partition
-        +StartForwarding()
-        +ForwardTask()
-        +ForwardPoll()
     }
 
     %% User Data Manager
@@ -190,17 +184,19 @@ classDiagram
 
     %% Data Types
     class internalTask {
-        +event persistencespb.TaskQueueInfo
+        +event persistencespb.TaskInfo
         +responseC chan~syncMatchResponse~
-        +isForwarded bool
+        +source TaskSource
+        +forwardCtx context.Context
         +isQuery()
-        +isStarted()
+        +isForwarded()
+        +isSyncMatchTask()
         +finish()
     }
 
     class PhysicalTaskQueueKey {
         +Partition tqid.Partition
-        +VersionSet string
+        +Version TaskQueueVersion
         +TaskType TaskType
     }
 
@@ -214,25 +210,25 @@ classDiagram
     taskQueuePartitionManagerImpl --> physicalTaskQueueManager : defaultQueue
     taskQueuePartitionManagerImpl --> physicalTaskQueueManager : versionedQueues *
     taskQueuePartitionManagerImpl --> userDataManager : uses
+    taskQueuePartitionManagerImpl --> rateLimitManager : uses
 
     physicalTaskQueueManager <|.. physicalTaskQueueManagerImpl : implements
     physicalTaskQueueManagerImpl --> backlogManager : uses
-    physicalTaskQueueManagerImpl --> TaskMatcher : legacy
-    physicalTaskQueueManagerImpl --> priTaskMatcher : new
-    physicalTaskQueueManagerImpl --> rateLimitManager : uses
+    physicalTaskQueueManagerImpl --> priTaskMatcher : uses
 
     priTaskMatcher --> matcherData : uses
     priTaskMatcher --> priForwarder : uses
-    TaskMatcher --> Forwarder : uses
+    priTaskMatcher --> waitingPoller : creates
 
-    backlogManager <|.. backlogManagerImpl : implements
-    backlogManagerImpl --> taskQueueDB : uses
-    backlogManagerImpl --> taskWriter : uses
-    backlogManagerImpl --> taskReader : uses
-    backlogManagerImpl --> ackManager : uses
+    backlogManager <|.. priBacklogManagerImpl : implements
+    priBacklogManagerImpl --> taskQueueDB : uses
+    priBacklogManagerImpl --> taskWriter : uses
+    priBacklogManagerImpl --> taskReader : uses
+    priBacklogManagerImpl --> ackManager : uses
 
     taskWriter --> taskQueueDB : writes to
     taskReader --> taskQueueDB : reads from
+    taskReader --> priTaskMatcher : AddTask
     ackManager --> taskQueueDB : updates
 ```
 
@@ -252,10 +248,14 @@ classDiagram
 - **physicalTaskQueueManagerImpl**: 物理队列,包含匹配器和积压管理
 
 ### 5. 任务匹配层 (Task Matcher Layer)
-- **TaskMatcher**: 传统匹配器 (channel-based)
-- **priTaskMatcher**: 新优先级匹配器 (priority queue-based)
+- **priTaskMatcher**: 优先级匹配器,基于优先级队列
+- **matcherData**: 核心数据结构,管理taskQueues和pollerQueues
+- **waitingPoller**: 等待中的Poller,包含转发上下文
 
-### 6. 持久化层 (Persistence Layer)
+### 6. 转发层 (Forwarder Layer)
+- **priForwarder**: 子分区转发器,转发任务和Poll到父分区
+
+### 7. 持久化层 (Persistence Layer)
 - **backlogManager**: 积压管理,处理DB操作
 - **taskWriter/taskReader/ackManager**: 读写和确认管理
 
